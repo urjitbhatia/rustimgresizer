@@ -9,52 +9,73 @@ fn status() -> &'static str {
     "OK"
 }
 
+use pipe::{pipe, PipeReader, PipeWriter};
+use std::fs::File;
+use std::io::Write;
+use std::{io, thread};
+
 use image::{GenericImageView, ImageError, ImageOutputFormat};
 use rocket::http::ContentType;
 use rocket::response::content::Content;
 use rocket::response::Stream;
-use std::io;
 
+/// Starts the given function in a thread and return a reader of the generated data
+fn image_piper<F: Send + 'static>(writefn: F) -> PipeReader
+where
+    F: FnOnce(PipeWriter) -> std::result::Result<(), ImageError>,
+{
+    let (reader, writer) = pipe();
+    thread::spawn(move || writefn(writer));
+    reader
+}
+/// Starts the given function in a thread and return a reader of the generated data
+fn io_piper<F: Send + 'static>(writefn: F) -> PipeReader
+where
+    F: FnOnce(PipeWriter) -> io::Result<()>,
+{
+    let (reader, writer) = pipe();
+    thread::spawn(move || writefn(writer));
+    reader
+}
 
-#[get("/resize?<height>&<width>")]
+#[get("/resize", rank = 1)]
+fn noresize() -> rocket::response::Content<Stream<File>> {
+    println!("using resize2");
+    let f = File::open("./test.jpg").unwrap();
+    return Content(ContentType::JPEG, Stream::from(f));
+}
+
+#[get("/resize?<height>&<width>", rank = 2)]
 fn resize(
     height: Option<f32>,
     width: Option<f32>,
-) -> rocket::response::Content<Stream<&'static [u8]>> {
+) -> rocket::response::Content<Stream<PipeReader>> {
     let img = image::open("./test.jpg").unwrap();
+
     let resized = resize_image(img, height, width);
     let r = match resized {
         Ok(rimg) => {
-            // let b: &[u8] = &rimg;
-            let str = Stream::from(&rimg[..]);
+            let pp = image_piper(move |mut w| rimg.write_to(&mut w, ImageOutputFormat::JPEG(90)));
+            let str = Stream::from(pp);
             Content(ContentType::JPEG, str)
-            // let str = Stream::from("error".as_bytes());
-            // Content(ContentType::Plain, str)
         }
         Err(err) => {
             print!("Error resizing img %{:?}", err);
-            let str = Stream::from("error".as_bytes());
-            Content(ContentType::Plain, str)
+            Content(
+                ContentType::Plain,
+                Stream::from(io_piper(|mut w| w.write_all(b"error"))),
+            )
         }
     };
 
     return r;
 }
-// #[get("/resize?<height>&<width>")]
-// fn resize(
-//     height: Option<f32>,
-//     width: Option<f32>,
-// ) -> rocket::response::Content<Result<Vec<u8>, ImageError>> {
-//     let img = image::open("./test.jpg").unwrap();
-// Content(ContentType::JPEG, resize_image(img, height, width))
-// }
 
 fn resize_image(
     img: image::DynamicImage,
     new_h: Option<f32>,
     new_w: Option<f32>,
-) -> Result<Vec<u8>, ImageError> {
-    let mut result: Vec<u8> = Vec::new();
+) -> Result<image::DynamicImage, ImageError> {
     let old_h = img.height() as f32;
     let old_w = img.width() as f32;
 
@@ -86,18 +107,11 @@ fn resize_image(
             )
         }
     };
-
-    scaled.write_to(&mut result, ImageOutputFormat::JPEG(90))?;
-
-    Ok(result)
-}
-
-struct Server {
-    img: image::DynamicImage,
+    Ok(scaled)
 }
 
 fn main() {
     rocket::ignite()
-        .mount("/", routes![status, resize])
+        .mount("/", routes![status, noresize, resize])
         .launch();
 }
