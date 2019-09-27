@@ -3,59 +3,83 @@
 #[macro_use]
 extern crate rocket;
 extern crate image;
+// Load the crate
+extern crate statsd;
+
+// Import the client object.
+use rocket::State;
+use statsd::Client;
+
+use pipe::{pipe, PipeReader, PipeWriter};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
+use std::{io, thread};
+
+use image::jpeg;
+use image::{GenericImageView, ImageError, ImageOutputFormat};
+use rocket::http::ContentType;
+use rocket::response::content::Content;
+use rocket::response::Stream;
+
+struct AppState {
+    statsd_client: Client,
+    memoized_img: image::DynamicImage,
+}
 
 #[get("/status")]
 fn status() -> &'static str {
     "OK"
 }
 
-use pipe::{pipe, PipeReader, PipeWriter};
-use std::fs::File;
-use std::io::Write;
-use std::{io, thread};
-
-use image::{GenericImageView, ImageError, ImageOutputFormat};
-use rocket::http::ContentType;
-use rocket::response::content::Content;
-use rocket::response::Stream;
-
 /// Starts the given function in a thread and return a reader of the generated data
-fn image_piper<F: Send + 'static>(writefn: F) -> PipeReader
+fn image_piper<F: Send + 'static>(writefn: F) -> BufReader<PipeReader>
 where
-    F: FnOnce(PipeWriter) -> std::result::Result<(), ImageError>,
+    F: FnOnce(BufWriter<PipeWriter>) -> std::result::Result<(), ImageError>,
 {
     let (reader, writer) = pipe();
-    thread::spawn(move || writefn(writer));
-    reader
+    let buf_reader = BufReader::with_capacity(32 * 1024, reader);
+    let buf_writer = BufWriter::with_capacity(32 * 1024, writer);
+    thread::spawn(move || writefn(buf_writer));
+    buf_reader
 }
+
 /// Starts the given function in a thread and return a reader of the generated data
-fn io_piper<F: Send + 'static>(writefn: F) -> PipeReader
+fn io_piper<F: Send + 'static>(writefn: F) -> BufReader<PipeReader>
 where
-    F: FnOnce(PipeWriter) -> io::Result<()>,
+    F: FnOnce(BufWriter<PipeWriter>) -> io::Result<()>,
 {
     let (reader, writer) = pipe();
-    thread::spawn(move || writefn(writer));
-    reader
+    let buf_writer = BufWriter::with_capacity(32 * 1024, writer);
+    let buf_reader = BufReader::with_capacity(32 * 1024, reader);
+    thread::spawn(move || writefn(buf_writer));
+    buf_reader
 }
 
 #[get("/resize", rank = 1)]
-fn noresize() -> rocket::response::Content<Stream<File>> {
+fn noresize() -> rocket::response::Content<Stream<std::io::BufReader<File>>> {
     println!("using resize2");
     let f = File::open("./test.jpg").unwrap();
-    return Content(ContentType::JPEG, Stream::from(f));
+    let fin = std::io::BufReader::with_capacity(32 * 1024, f);
+    return Content(ContentType::JPEG, Stream::from(fin));
 }
 
 #[get("/resize?<height>&<width>", rank = 2)]
 fn resize(
     height: Option<f32>,
     width: Option<f32>,
-) -> rocket::response::Content<Stream<PipeReader>> {
-    let img = image::open("./test.jpg").unwrap();
-
+    state: State<AppState>,
+) -> Result<rocket::response::Content<Stream<BufReader<PipeReader>>>, io::Error> {
+    let img = state.memoized_img.clone();
     let resized = resize_image(img, height, width);
     let r = match resized {
         Ok(rimg) => {
-            let pp = image_piper(move |mut w| rimg.write_to(&mut w, ImageOutputFormat::JPEG(90)));
+            let bytes = rimg.raw_pixels();
+            let mut ww: Vec<u8> = vec![];
+            let mut j = jpeg::JPEGEncoder::new_with_quality(&mut ww, 85);
+
+            j.encode(&bytes, rimg.width(), rimg.height(), rimg.color())
+                .unwrap();
+            let pp = image_piper(move |mut w| rimg.write_to(&mut w, ImageOutputFormat::JPEG(85)));
             let str = Stream::from(pp);
             Content(ContentType::JPEG, str)
         }
@@ -68,7 +92,7 @@ fn resize(
         }
     };
 
-    return r;
+    return Ok(r);
 }
 
 fn resize_image(
@@ -111,7 +135,13 @@ fn resize_image(
 }
 
 fn main() {
+    let img = image::open("./test.jpg").unwrap();
+    let client = Client::new("127.0.0.1:8125", "rimgresizer").unwrap();
     rocket::ignite()
-        .mount("/", routes![status, noresize, resize])
+        .manage(AppState {
+            statsd_client: client,
+            memoized_img: img,
+        })
+        .mount("/", routes![status, resize])
         .launch();
 }
